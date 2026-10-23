@@ -5,7 +5,7 @@ services:
     container_name: fastapi_postgres
     restart: unless-stopped
 
-    cpuset: "7-7"  # PostgreSQL runs on CPU cores 7
+    cpuset: "7"  # PostgreSQL pinned to CPU core 7
 
     environment:
       POSTGRES_USER: postgres
@@ -27,6 +27,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: redis
+    cpuset: "8"  # Redis pinned to CPU core 8
     ports:
       - "6379:6379"
     restart: unless-stopped
@@ -54,6 +55,7 @@ services:
     build: .
     image: load_test:latest
     container_name: load_test_app
+    cpuset: "9"  # App pinned to CPU core 9
     restart: unless-stopped
     ports:
       - "8082:8082"
