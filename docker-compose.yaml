@@ -1,0 +1,36 @@
+services:
+
+  postgres:
+    image: postgres:17
+    container_name: fastapi_postgres
+    restart: unless-stopped
+
+    cpuset: "7-7"  # PostgreSQL runs on CPU cores 7
+
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: users
+
+    ports:
+      - "127.0.0.1:5432:5432"
+
+    volumes:
+      - postgres_data:/var/lib/postgresql/data2
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U fastapi -d users_db"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    container_name: redis
+    ports:
+      - "6379:6379"
+    command: redis-server --maxmemory 256mb --maxmemory-policy allkeys-lru
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
