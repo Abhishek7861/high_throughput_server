@@ -8,8 +8,6 @@ import org.springframework.web.bind.annotation.*;
 
 import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
-import java.util.ArrayList;
-import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
 
 @RestController
@@ -21,7 +19,6 @@ public class LocalController {
             .createdAt(Instant.now())
             .hashCode("df2463d4-b6b5-4fec-8690-f9d9e318c3e7")
             .build();
-    private final List<Payload> payloadList = new ArrayList<>();
     private static final long MIN_SEEDED_ID = 1;
     private static final long MAX_SEEDED_ID = 100;
 
@@ -40,7 +37,7 @@ public class LocalController {
                 .createdAt(Instant.now())
                 .hashCode(payloadDTO.getHash())
                 .build();
-        payloadList.add(payloadTemp);
+        // Not stored: this endpoint is an in-memory baseline, and keeping every payload leaked memory under load
         return ResponseEntity.status(HttpStatus.CREATED).body(payloadTemp);
     }
 
