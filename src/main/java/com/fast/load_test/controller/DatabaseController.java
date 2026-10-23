@@ -17,6 +17,7 @@ import org.springframework.web.server.ResponseStatusException;
 import java.net.URI;
 import java.time.Instant;
 import static org.springframework.http.HttpStatus.BAD_REQUEST;
+import java.util.concurrent.ThreadLocalRandom;
 
 @RestController
 @RequestMapping("/database/payload")
@@ -24,9 +25,14 @@ import static org.springframework.http.HttpStatus.BAD_REQUEST;
 public class DatabaseController {
     private final PayloadRepository payloadRepository;
     private final PayloadService payloadService;
+    // Ids seeded by DatabaseSeeder
+    private static final long MIN_SEEDED_ID = 1;
+    private static final long MAX_SEEDED_ID = 100;
 
-    @GetMapping("/{id}")
-    public ResponseEntity<Payload> findById(@PathVariable Long id) {
+    @GetMapping
+    public ResponseEntity<Payload> findById() {
+        // ThreadLocalRandom avoids contention on a shared Random under load; upper bound is exclusive
+        long id = ThreadLocalRandom.current().nextLong(MIN_SEEDED_ID, MAX_SEEDED_ID + 1);
         return ResponseEntity.ok(payloadService.findById(id));
     }
 

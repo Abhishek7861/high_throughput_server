@@ -6,6 +6,9 @@ import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.cache.annotation.Cacheable;
 import org.springframework.stereotype.Service;
+import org.springframework.web.server.ResponseStatusException;
+
+import static org.springframework.http.HttpStatus.NOT_FOUND;
 
 @Service
 @Slf4j
@@ -19,6 +22,6 @@ public class PayloadService {
         log.info("Redis Miss, Fetching id {} from PostgreSQL",id);
 
         return payloadRepository.findById(id)
-                .orElseThrow(()-> new RuntimeException("Payload not found"));
+                .orElseThrow(()-> new ResponseStatusException(NOT_FOUND, "Payload " + id + " not found"));
     }
 }
