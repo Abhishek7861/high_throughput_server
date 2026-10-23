@@ -35,4 +35,9 @@ public class Payload implements Serializable {
 
     @Column(nullable = false)
     private String hashCode;
+
+    // Redis stream entry id for rows written by PayloadBatchConsumer (null for direct writes);
+    // unique so a replayed stream event can't insert a duplicate row
+    @Column(unique = true, updatable = false)
+    private String eventId;
 }
