@@ -13,7 +13,7 @@ import java.util.List;
 import java.util.concurrent.ThreadLocalRandom;
 
 @RestController
-@RequestMapping("/api/users")
+@RequestMapping("/local/payload")
 public class LocalController {
 
     private final Payload payload = Payload.builder()
