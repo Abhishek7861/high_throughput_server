@@ -109,6 +109,32 @@ so use the results to compare runs rather than as absolute capacity numbers.
 Start the stack and warm up the JVM for ~15 s before measuring; runs on a freshly
 started app understate throughput.
 
+### Full suite
+
+`loadtest/run.sh` tests every endpoint with [wrk](https://github.com/wg/wrk) (4 threads,
+50 connections): a 10 s warmup, then a 20 s measured run, while recording `docker stats`.
+It needs `wrk` and `python3`, and the compose stack running.
+
+```bash
+./loadtest/run.sh
+```
+
+It prints a summary, then checks that every `POST /stream/payload` request became a row:
+
+```text
+test              req/s      p50      p90      p99    p99.9  errors
+get_database     33,488    1.35ms   1.88ms   4.23ms   22.2ms       0
+...
+Stream: 828270 requests -> 828361 rows, backlog 0, pending 0, dead-lettered 2
+```
+
+Raw output goes to `loadtest/results/<timestamp>/` (git-ignored): each run's wrk JSON
+summary with per-second response counts and latency percentiles, and a CPU/memory CSV per
+container. The wrk scripts are `loadtest/get.lua` and `loadtest/post.lua`; run wrk from
+inside `loadtest/` so they can load `common.lua`.
+
+### Single endpoint
+
 **Writes** with [autocannon](https://github.com/mcollina/autocannon):
 
 ```bash
@@ -126,51 +152,61 @@ Add `--renderStatusCodes` to confirm every response is 201/200. Watch which cont
 saturates with `docker stats` during a run.
 
 autocannon's throughput is reliable here, but its latency numbers were not (it reported
-~100 ms p50 where 50 connections at 18k req/s implies ~3 ms). Use
-[wrk](https://github.com/wg/wrk) for latency:
+~100 ms p50 where 50 connections at 18k req/s implies ~3 ms). Use wrk for latency:
 
 ```bash
-cat > post.lua <<'EOF'
-wrk.method = "POST"
-wrk.headers["Content-Type"] = "application/json"
-wrk.body = '{"hash":"df2463d4-b6b5-4fec-8690-f9d9e318c3e7"}'
-EOF
-wrk -t4 -c50 -d20s --latency -s post.lua http://localhost:8082/database/payload
+cd loadtest
+wrk -t4 -c50 -d20s --latency -s post.lua http://localhost:8082/stream/payload
 ```
 
-Point the same script at `http://localhost:8082/stream/payload` to test async writes.
-Afterwards check that `XLEN payload:write-stream` drains to 0 and compare the number of
-new rows (`select count(*) from payloads where event_id is not null`) with requests sent.
+After a stream test, check that `XLEN payload:write-stream` drains to 0 and compare the
+number of new rows (`select count(*) from payloads where event_id is not null`) with
+requests sent.
 
 ### Results (2026-10-23)
 
-Docker Desktop on macOS with the default CPU layout (app 3 cores, Postgres 2, Redis 1),
-`synchronous_commit=off` and virtual threads enabled, 50 connections, after warmup.
+Full suite on Docker Desktop on macOS with the default CPU layout (app 3 cores,
+Postgres 2, Redis 1), `synchronous_commit=off` and virtual threads enabled. Charts of
+this run (throughput each second, latency percentiles, CPU per container) are on the
+[load test dashboard](https://claude.ai/artifact/JSwwVnYT5FupvAKHrmLz4V), which is private
+until shared.
 
-| Test   | Throughput      | p50 (wrk) | p99 (wrk) | Status codes |
-|--------|-----------------|-----------|-----------|--------------|
-| POST `/database/payload` | ~18,200 req/s   | 2.8 ms    | 7.1 ms    | all 201      |
-| POST `/stream/payload`   | ~32,100 req/s   | 1.4 ms    | 4.2 ms    | all 202      |
-| GET `/database/payload`  | ~30,400 req/s   | —         | —         | all 200      |
+| Endpoint                  | Req/s  | p50     | p90     | p99      | p99.9    | Max      | Errors |
+|---------------------------|--------|---------|---------|----------|----------|----------|--------|
+| GET `/local/payload`      | 36,278 | 1.23 ms | 1.75 ms | 4.82 ms  | 48.8 ms  | 66.9 ms  | 0      |
+| GET `/database/payload`   | 32,758 | 1.36 ms | 1.97 ms | 4.98 ms  | 38.4 ms  | 60.2 ms  | 0      |
+| POST `/local/payload`     | 29,962 | 1.46 ms | 2.30 ms | 17.0 ms  | 158 ms   | 185 ms   | 0      |
+| POST `/stream/payload`    | 26,819 | 1.65 ms | 2.53 ms | 5.37 ms  | 13.4 ms  | 39.4 ms  | 0      |
+| POST `/database/payload`  | 17,040 | 2.60 ms | 4.44 ms | 10.5 ms  | 54.1 ms  | 86.3 ms  | 0      |
 
-CPU under load:
+Peak CPU during each run:
 
-| Test          | App (of 300%) | Postgres (of 200%) | Redis (of 100%) |
-|---------------|---------------|--------------------|-----------------|
-| POST database | ~275%         | ~155%              | <1%             |
-| POST stream   | ~250%         | ~60%               | ~35%            |
-| GET           | ~260%         | <1%                | ~19%            |
+| Endpoint       | App (of 300%) | Postgres (of 200%) | Redis (of 100%) |
+|----------------|---------------|--------------------|-----------------|
+| GET database   | 262%          | 6%                 | 22%             |
+| POST database  | 276%          | 166%               | 2%              |
+| POST stream    | 248%          | 71%                | 42%             |
+| GET local      | 247%          | 21%                | 2%              |
+| POST local     | 269%          | 6%                 | 3%              |
 
-- The app's CPU is the bottleneck for reads and both write paths.
-- The stream path accepts ~1.8× more writes than direct inserts and uses far less
-  Postgres CPU thanks to batching. The consumer kept up: the backlog was 0 when load
-  stopped, and 644,785 requests produced 644,830 rows (the extra are requests still in
-  flight when wrk stopped counting), so no events were lost.
-- Reads hardly touch Postgres: all 100 seeded ids stay in Redis after warmup, so the
-  read test measures the app + Redis path, not the database.
+- Every request succeeded: about 2.87 million measured requests, no non-2xx responses
+  and no socket errors.
+- The app's CPU is the bottleneck for every endpoint, including the in-memory ones that
+  touch neither Postgres nor Redis.
+- Writing through Redis Streams carries ~1.6× the sync insert rate with about 40% of the
+  Postgres CPU, and has the tightest tail of any endpoint (p99.9 13.4 ms). The consumer
+  kept up: 833,107 stream requests (warmup included) became 833,199 rows; the extra are
+  requests still in flight when wrk stopped counting.
+- Cached reads cost almost the same as in-memory reads, so the Redis lookup is cheap.
+  All 100 seeded ids stay cached after warmup, so this test doesn't load Postgres.
+- Throughput moves a lot from second to second (POST `/local/payload` ranged from 19.9k
+  to 39.8k req/s) because Docker Desktop's virtual CPUs share the Mac with wrk. That
+  run's 158 ms p99.9 came from a few slow seconds; app memory stayed flat, and a repeat
+  run measured p99.9 21 ms. Treat differences under ~20% between runs as noise.
 - Write throughput history: 5,319 req/s baseline → 5,522 with `synchronous_commit=off`
   and `open-in-view=false` → 7,813 with virtual threads (all with a short 10 s warmup);
-  ~16–18k req/s after a longer warmup.
+  ~16–18k req/s after a longer warmup. Before the leak fix, POST `/local/payload` grew
+  the app's memory from 667 MiB to 1.16 GiB in one run and never released it.
 
 ## Configuration
 

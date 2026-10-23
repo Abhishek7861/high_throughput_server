@@ -31,3 +31,6 @@ build/
 
 ### VS Code ###
 .vscode/
+
+### Load test output ###
+loadtest/results/
