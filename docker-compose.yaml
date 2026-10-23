@@ -5,7 +5,7 @@ services:
     container_name: fastapi_postgres
     restart: unless-stopped
 
-    cpuset: "7"  # PostgreSQL pinned to CPU core 7
+    cpuset: "7-8"  # PostgreSQL pinned to CPU cores 7-8
 
     environment:
       POSTGRES_USER: postgres
@@ -27,7 +27,7 @@ services:
   redis:
     image: redis:7-alpine
     container_name: redis
-    cpuset: "8"  # Redis pinned to CPU core 8
+    cpuset: "9"  # Redis is single-threaded; pinned to CPU core 9
     ports:
       - "6379:6379"
     restart: unless-stopped
@@ -55,7 +55,9 @@ services:
     build: .
     image: load_test:latest
     container_name: load_test_app
-    cpuset: "9"  # App pinned to CPU core 9
+    # App on cores 4-6 by default; override to test scaling, e.g. APP_CPUSET=4-5 docker compose up -d app
+    # Cores 0-3 are left free for the load generator.
+    cpuset: "${APP_CPUSET:-4-6}"
     restart: unless-stopped
     ports:
       - "8082:8082"
