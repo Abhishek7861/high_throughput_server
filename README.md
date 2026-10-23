@@ -1,4 +1,4 @@
-# high_throughput_server
+# High Throughput Server
 
 Spring Boot service for load testing a PostgreSQL read path with a Redis cache in front.
 
