@@ -10,6 +10,7 @@ import java.security.NoSuchAlgorithmException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.concurrent.ThreadLocalRandom;
 
 @RestController
 @RequestMapping("/api/users")
@@ -21,6 +22,8 @@ public class LocalController {
             .hashCode("df2463d4-b6b5-4fec-8690-f9d9e318c3e7")
             .build();
     private final List<Payload> payloadList = new ArrayList<>();
+    private static final long MIN_SEEDED_ID = 1;
+    private static final long MAX_SEEDED_ID = 100;
 
     @GetMapping
     public ResponseEntity<Payload> findAll() throws NoSuchAlgorithmException {
@@ -29,8 +32,11 @@ public class LocalController {
 
     @PostMapping
     public ResponseEntity<Payload> addPayload(@RequestBody PayloadDTO payloadDTO) throws NoSuchAlgorithmException {
+        // ThreadLocalRandom avoids contention on a shared Random under load; upper bound is exclusive
+        long id = ThreadLocalRandom.current().nextLong(MIN_SEEDED_ID, MAX_SEEDED_ID + 1);
+
         Payload payloadTemp = Payload.builder()
-                .id(1L)
+                .id(id)
                 .createdAt(Instant.now())
                 .hashCode(payloadDTO.getHash())
                 .build();
