@@ -50,6 +50,26 @@ services:
     volumes:
       - redis_data:/data
 
+  app:
+    build: .
+    image: load_test:latest
+    container_name: load_test_app
+    restart: unless-stopped
+    ports:
+      - "8082:8082"
+    environment:
+      # Inside the compose network, services are reached by service name, not localhost
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/users
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_DATA_REDIS_HOST: redis
+      SPRING_DATA_REDIS_PORT: 6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+      # Not service_healthy: the app is built to run without Redis
+      redis:
+        condition: service_started
 
 volumes:
   postgres_data:
