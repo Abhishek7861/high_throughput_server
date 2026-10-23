@@ -47,6 +47,31 @@ On every startup the `payload` table is recreated and seeded with 100 rows (ids 
   warnings and reads fall through to PostgreSQL (see `config/CacheConfig.java`).
   Redis timeouts are 200 ms, so an outage adds at most that much per request.
 
+## CPU layout
+
+Each container is pinned to its own cores in `docker-compose.yaml`:
+
+| Cores | Used by                       |
+|-------|-------------------------------|
+| 0–3   | Free for the load generator   |
+| 4–6   | App (`load_test_app`)         |
+| 7–8   | PostgreSQL                    |
+| 9     | Redis (single-threaded)       |
+
+To see how throughput scales with the app's core count, override `APP_CPUSET` and
+recreate only the app:
+
+```bash
+APP_CPUSET=4 docker compose up -d app      # 1 core
+APP_CPUSET=4-5 docker compose up -d app    # 2 cores
+APP_CPUSET=4-6 docker compose up -d app    # 3 cores (default)
+```
+
+If the load generator runs in Docker, keep it off these cores with `--cpuset-cpus=0-3`.
+
+On Docker Desktop these are the Linux VM's virtual CPUs, not dedicated physical cores,
+so use the results to compare runs rather than as absolute capacity numbers.
+
 ## Configuration
 
 Defaults in `application.properties` target `localhost`. Override them with environment
