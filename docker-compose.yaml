@@ -1,3 +1,30 @@
+# Shared settings for the six Redis Cluster nodes (3 primaries, 3 replicas)
+x-redis-node: &redis-node
+  image: redis:7-alpine
+  cpuset: "9"  # All Redis nodes share CPU core 9, as the single Redis did before
+  restart: unless-stopped
+  # Each node announces its hostname, so clients follow MOVED redirects by name
+  command:
+    - sh
+    - -c
+    - >-
+      exec redis-server
+      --port 6379
+      --cluster-enabled yes
+      --cluster-config-file nodes.conf
+      --cluster-node-timeout 5000
+      --cluster-announce-hostname $${REDIS_NODE_NAME}
+      --cluster-preferred-endpoint-type hostname
+      --appendonly yes
+      --appendfsync everysec
+      --aof-use-rdb-preamble yes
+      --dir /data
+  healthcheck:
+    test: ["CMD", "redis-cli", "ping"]
+    interval: 5s
+    timeout: 3s
+    retries: 10
+
 services:
 
   postgres:
@@ -7,21 +34,37 @@ services:
 
     cpuset: "7-8"  # PostgreSQL pinned to CPU cores 7-8
 
-    # Don't wait for the WAL flush on every commit: much higher write throughput, but a
-    # Postgres crash can lose the last ~600ms of acknowledged writes (no corruption).
-    # Remove for durability-sensitive tests.
-    command: ["postgres", "-c", "synchronous_commit=off"]
+    # synchronous_commit=off: don't wait for the WAL flush on every commit. Much higher write
+    # throughput, but a Postgres crash can lose the last ~600ms of acknowledged writes (no
+    # corruption). Remove for durability-sensitive tests.
+    # max_slot_wal_keep_size caps how much WAL the replica's slot can hold back if the
+    # replica stops, so a dead replica can't fill the disk.
+    command:
+      - postgres
+      - -c
+      - synchronous_commit=off
+      - -c
+      - wal_level=replica
+      - -c
+      - max_wal_senders=10
+      - -c
+      - max_slot_wal_keep_size=1GB
 
     environment:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
       POSTGRES_DB: users
+      POSTGRES_REPLICATION_PASSWORD: replicator
 
     ports:
       - "127.0.0.1:5432:5432"
 
     volumes:
-      - postgres_data:/var/lib/postgresql/data2
+      - postgres_data:/var/lib/postgresql/data
+      # Creates the replication user and slot on first initialization
+      - ./postgres/primary-init.sh:/docker-entrypoint-initdb.d/10-replication.sh:ro
+
+    networks: [ backend ]
 
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U postgres -d users"]
@@ -29,32 +72,108 @@ services:
       timeout: 5s
       retries: 10
 
-  redis:
-    image: redis:7-alpine
-    container_name: redis
-    cpuset: "9"  # Redis is single-threaded; pinned to CPU core 9
-    ports:
-      - "6379:6379"
+  # Hot standby: streams WAL from the primary and serves read-only queries
+  postgres-replica:
+    image: postgres:17
+    container_name: postgres_replica
     restart: unless-stopped
-    command:
-      - redis-server
-      - --appendonly
-      - "yes"
-      - --appendfsync
-      - everysec
-      - --dir
-      - /data
-      - --aof-use-rdb-preamble
-      - "yes"
-
-    healthcheck:
-      test: [ "CMD", "redis-cli", "ping" ]
-      interval: 10s
-      timeout: 3s
-      retries: 5
-
+    cpuset: "7-8"  # Shares the primary's cores
+    user: postgres
+    entrypoint: ["/replica-entrypoint.sh"]
+    environment:
+      PRIMARY_HOST: postgres
+      PGPASSWORD: replicator  # used by pg_basebackup and saved into the replica's conninfo
+    ports:
+      - "127.0.0.1:5433:5432"
     volumes:
-      - redis_data:/data
+      - postgres_replica_data:/var/lib/postgresql/data
+      - ./postgres/replica-entrypoint.sh:/replica-entrypoint.sh:ro
+    networks: [ backend ]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d users"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+
+  # Fixed IPs: nodes remember each other by IP in nodes.conf, so the cluster survives
+  # containers being recreated
+  redis-node-1:
+    <<: *redis-node
+    container_name: redis-node-1
+    hostname: redis-node-1
+    environment: { REDIS_NODE_NAME: redis-node-1 }
+    volumes: [ "redis_node_1:/data" ]
+    networks: { backend: { ipv4_address: 172.30.0.11 } }
+
+  redis-node-2:
+    <<: *redis-node
+    container_name: redis-node-2
+    hostname: redis-node-2
+    environment: { REDIS_NODE_NAME: redis-node-2 }
+    volumes: [ "redis_node_2:/data" ]
+    networks: { backend: { ipv4_address: 172.30.0.12 } }
+
+  redis-node-3:
+    <<: *redis-node
+    container_name: redis-node-3
+    hostname: redis-node-3
+    environment: { REDIS_NODE_NAME: redis-node-3 }
+    volumes: [ "redis_node_3:/data" ]
+    networks: { backend: { ipv4_address: 172.30.0.13 } }
+
+  redis-node-4:
+    <<: *redis-node
+    container_name: redis-node-4
+    hostname: redis-node-4
+    environment: { REDIS_NODE_NAME: redis-node-4 }
+    volumes: [ "redis_node_4:/data" ]
+    networks: { backend: { ipv4_address: 172.30.0.14 } }
+
+  redis-node-5:
+    <<: *redis-node
+    container_name: redis-node-5
+    hostname: redis-node-5
+    environment: { REDIS_NODE_NAME: redis-node-5 }
+    volumes: [ "redis_node_5:/data" ]
+    networks: { backend: { ipv4_address: 172.30.0.15 } }
+
+  redis-node-6:
+    <<: *redis-node
+    container_name: redis-node-6
+    hostname: redis-node-6
+    environment: { REDIS_NODE_NAME: redis-node-6 }
+    volumes: [ "redis_node_6:/data" ]
+    networks: { backend: { ipv4_address: 172.30.0.16 } }
+
+  # Forms the cluster on first start (3 primaries, 1 replica each); a no-op once it exists
+  redis-cluster-init:
+    image: redis:7-alpine
+    container_name: redis-cluster-init
+    restart: "no"
+    networks: [ backend ]
+    depends_on:
+      redis-node-1: { condition: service_healthy }
+      redis-node-2: { condition: service_healthy }
+      redis-node-3: { condition: service_healthy }
+      redis-node-4: { condition: service_healthy }
+      redis-node-5: { condition: service_healthy }
+      redis-node-6: { condition: service_healthy }
+    entrypoint: ["sh", "-c"]
+    command:
+      - |
+        if redis-cli -h redis-node-1 cluster info | grep -q 'cluster_state:ok'; then
+          echo "Redis Cluster already formed"
+          exit 0
+        fi
+        redis-cli --cluster create \
+          172.30.0.11:6379 172.30.0.12:6379 172.30.0.13:6379 \
+          172.30.0.14:6379 172.30.0.15:6379 172.30.0.16:6379 \
+          --cluster-replicas 1 --cluster-yes
+        until redis-cli -h redis-node-1 cluster info | grep -q 'cluster_state:ok'; do sleep 1; done
+        echo "Redis Cluster formed"
 
   app:
     build: .
@@ -71,15 +190,31 @@ services:
       SPRING_DATASOURCE_URL: jdbc:postgresql://postgres:5432/users
       SPRING_DATASOURCE_USERNAME: postgres
       SPRING_DATASOURCE_PASSWORD: postgres
-      SPRING_DATA_REDIS_HOST: redis
-      SPRING_DATA_REDIS_PORT: 6379
+      APP_DATASOURCE_REPLICA_JDBC_URL: jdbc:postgresql://postgres-replica:5432/users?connectTimeout=1&socketTimeout=5
+      # Seed nodes only: Lettuce discovers the full topology from any of them
+      SPRING_DATA_REDIS_CLUSTER_NODES: redis-node-1:6379,redis-node-2:6379,redis-node-3:6379
+    networks: [ backend ]
     depends_on:
       postgres:
         condition: service_healthy
-      # Not service_healthy: the app is built to run without Redis
-      redis:
+      # Started with the app, but not waited for: reads fall back to the primary without it
+      postgres-replica:
         condition: service_started
+      redis-cluster-init:
+        condition: service_completed_successfully
+
+networks:
+  backend:
+    ipam:
+      config:
+        - subnet: 172.30.0.0/24
 
 volumes:
   postgres_data:
-  redis_data:
+  postgres_replica_data:
+  redis_node_1:
+  redis_node_2:
+  redis_node_3:
+  redis_node_4:
+  redis_node_5:
+  redis_node_6:

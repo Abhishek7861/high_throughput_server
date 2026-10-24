@@ -163,14 +163,15 @@ public class PayloadBatchConsumer implements SmartLifecycle {
 
         StreamOperations<String, Object, Object> ops = redisTemplate.opsForStream();
         PendingMessages pending = ops.pending(KEY, GROUP, Range.unbounded(), BATCH_SIZE, CLAIM_MIN_IDLE);
+        // Includes our own records: a read whose reply never arrived (e.g. one the Redis client
+        // re-sent after a reconnect) leaves records pending on this consumer without it knowing
         RecordId[] stale = pending.stream()
-                .filter(message -> !consumerName.equals(message.getConsumerName()))
                 .map(PendingMessage::getId)
                 .toArray(RecordId[]::new);
         if (stale.length > 0) {
             ops.claim(KEY, GROUP, consumerName, CLAIM_MIN_IDLE, stale);
             checkPending = true;
-            log.info("Claimed {} stale pending records from other consumers", stale.length);
+            log.info("Claimed {} pending records idle for over {}", stale.length, CLAIM_MIN_IDLE);
         }
     }
 

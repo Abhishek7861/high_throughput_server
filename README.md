@@ -3,10 +3,8 @@
 Spring Boot service for load testing a PostgreSQL read path with a Redis cache in front. Spring Boot payload API with Redis caching, Redis Streams write-behind into PostgreSQL, and a wrk load test suite. Reaches ~33k cached reads/s and ~27k async writes/s on 3 cores, with no lost events.
 
 
-
 ## Architecture
-![img_1.png](img_1.png)
-
+![img_2.png](img_2.png)
 ## Running
 
 ### Everything in Docker
@@ -15,14 +13,19 @@ Spring Boot service for load testing a PostgreSQL read path with a Redis cache i
 docker compose up -d --build
 ```
 
-This starts PostgreSQL, Redis and the app (`load_test_app`) on `http://localhost:8082`.
+This starts a PostgreSQL primary and streaming replica, a six-node Redis Cluster and the app
+(`load_test_app`) on `http://localhost:8082`. On first start, `redis-cluster-init` forms the cluster and exits.
 After code changes, rebuild just the app with `docker compose up -d --build app`.
 Follow its logs with `docker compose logs -f app`.
 
 ### App locally, dependencies in Docker
 
+The cluster nodes are only reachable inside the compose network, so an app run outside
+Docker uses a standalone Redis on `localhost:6379` instead:
+
 ```bash
-docker compose up -d postgres redis
+docker compose up -d postgres postgres-replica
+docker run -d --name redis-local -p 6379:6379 redis:7-alpine
 ./mvnw spring-boot:run
 ```
 
@@ -54,6 +57,114 @@ On every startup the `payloads` table is recreated and seeded with 100 rows (ids
   Redis timeouts are 200 ms, so an outage adds at most that much per request.
   `POST /stream/payload` does need Redis and fails while it's down.
 
+## PostgreSQL replication
+
+`postgres` (container `fastapi_postgres`, port 5432) is the primary. `postgres-replica`
+(container `postgres_replica`, port 5433) is a hot standby that streams the primary's WAL
+and serves read-only queries.
+
+### Read routing
+
+Read-only transactions go to the replica; everything else goes to the primary
+(`config/DataSourceConfig.java`). In practice that means cache misses in `GET /database/payload`:
+Spring Data's `findById` runs in a read-only transaction. Writes, schema creation, seeding and
+the stream consumer use the primary.
+
+- A `LazyConnectionDataSourceProxy` picks the pool at the first SQL statement, after the
+  transaction has marked the connection read-only.
+- If the replica can't give a connection, `ReplicaFallbackDataSource` uses the primary and
+  skips the replica for the next 5 s, logging one warning. The replica pool's 250 ms connection
+  timeout and the driver's 1 s connect and 5 s socket timeouts bound how long a read waits.
+- Reads can be stale by the replication lag (under 230 ms at full write load). A row read right
+  after it was written may not be on the replica yet.
+- Without `app.datasource.replica.jdbc-url`, all queries use the primary.
+
+Tested on 2026-10-24:
+
+- After clearing the cache, 300 reads ran 94 table scans on the replica and none on the primary.
+  With a warm cache, only the remaining misses reached the replica.
+- With the replica stopped while the app held 10 connections to it, 300 cold-cache reads all
+  returned 200 (3.5 ms average). One request took 298 ms, waiting out the pool timeout before
+  falling back; the primary served the reads. After the replica restarted, reads went back to it.
+- Sync inserts measured 13.7k–15.4k req/s across three runs, about 19% below the 18.1k measured
+  before routing. That is at the edge of run-to-run noise here and hasn't been isolated.
+
+### Replication
+
+- On first start the primary runs `postgres/primary-init.sh`, which creates the
+  `replicator` role, a `pg_hba.conf` rule for replication connections and the physical
+  replication slot `replica_1`.
+- On first start the replica copies the primary with `pg_basebackup` and writes its standby
+  settings (`postgres/replica-entrypoint.sh`). After that it starts as a standby straight away.
+- The slot makes the primary keep WAL until the replica has received it, so a replica that
+  falls behind or restarts catches up. `max_slot_wal_keep_size=1GB` caps that, so a dead
+  replica can't fill the disk; past the cap the replica has to be rebuilt.
+- Replication is asynchronous. With `synchronous_commit=off` as well, a primary crash can lose
+  the last ~600 ms of acknowledged writes on both servers.
+- Data now persists across container recreation. Earlier the primary's volume was mounted at
+  `/var/lib/postgresql/data2` instead of the data directory, so nothing was kept.
+
+Measured on 2026-10-24: writes reached the replica within 0.5 s. Under 20 s of full write load
+it stayed at most 230 ms behind (about 70–85 ms on average, at most 0.9 MB of WAL), and it
+ended with exactly the primary's 1,065,890 rows. Write throughput was unchanged (18,127 sync
+inserts/s, 26,974 stream writes/s). After restarting the primary, replication resumed within
+6 s. Failover isn't automatic; to promote the replica:
+
+```bash
+docker exec postgres_replica psql -U postgres -c "SELECT pg_promote()"
+```
+
+Then point `SPRING_DATASOURCE_URL` at `postgres-replica` and restart the app. The old primary
+must be rebuilt as a replica before it rejoins. Check replication with:
+
+```bash
+docker exec fastapi_postgres psql -U postgres -c "SELECT client_addr, state, replay_lag FROM pg_stat_replication"
+docker exec postgres_replica psql -U postgres -c "SELECT pg_is_in_recovery()"
+```
+
+## Redis Cluster
+
+Under Docker Compose, Redis runs as a six-node cluster: `redis-node-1` to `redis-node-3`
+start as primaries, each owning a third of the 16,384 hash slots, and `redis-node-4` to
+`redis-node-6` are their replicas.
+
+- Nodes have fixed IPs on the `backend` network (`172.30.0.11` to `.16`) because they find
+  each other by IP from `nodes.conf`. They announce their hostnames to clients, so MOVED
+  redirects name `redis-node-N`. Each node keeps its own append-only file and `nodes.conf`
+  on its own volume.
+- `redis-cluster-init` runs `redis-cli --cluster create` once, then exits. On later starts it
+  sees `cluster_state:ok` and does nothing. The app starts only after it completes.
+- The app gets the seed nodes from `SPRING_DATA_REDIS_CLUSTER_NODES` and discovers the rest.
+  Lettuce re-reads the topology on redirects and reconnects, and every 10 s.
+- Cache keys spread across the three primaries. The stream is a single key, so it lives on
+  one primary and its write throughput is bounded by that node.
+
+Check the cluster with:
+
+```bash
+docker exec redis-node-1 redis-cli cluster info
+docker exec redis-node-1 redis-cli cluster shards
+```
+
+### Failover (tested 2026-10-24)
+
+Killing `redis-node-1`, the primary holding the stream, under steady stream writes and
+cached reads:
+
+- Its replica `redis-node-5` became primary after about 7 s (5 s node timeout plus the
+  election). The app picked up the new topology about 6 s later.
+- Stream writes failed with 500 for about 13 s, then recovered on their own. Reads returned
+  200 throughout; keys on the failed node's slots fell back to PostgreSQL.
+- All 4,513 events that got a 202 reached PostgreSQL. Restarting `redis-node-1` made it
+  rejoin as a replica of `redis-node-5`.
+- 4 writes that returned 500 were still added to the stream later. Lettuce queues commands
+  for a node while it is down and sends them, even after they timed out in the app, once it
+  reconnects. A client that retries such a write creates a duplicate row. Queued reads also
+  left those 4 entries pending on the consumer without it seeing them; the consumer now
+  reclaims its own entries idle for over 30 s, so they were written about 40 s later.
+- Replication is asynchronous, so a write acknowledged by a primary that dies before
+  replicating it can be lost. None were lost in this test.
+
 ## Async writes (Redis Streams)
 
 `POST /stream/payload` adds `{hash}` to the `payload:write-stream` stream and returns
@@ -70,8 +181,9 @@ On every startup the `payloads` table is recreated and seeded with 100 rows (ids
 - Records that can never be written (e.g. a missing or too-long hash) are moved to
   `payload:write-stream:dlq` with the error, and the rest of the batch still goes through.
 - Each instance uses `HOSTNAME` as its consumer name (override with
-  `payload.stream.consumer-name`) and claims records left pending for over 30 s by other
-  consumers, e.g. after a container is recreated.
+  `payload.stream.consumer-name`). Every 30 s it claims records left pending for over 30 s,
+  whether by another consumer (e.g. after a container is recreated) or by itself (a read
+  whose reply never arrived).
 
 The 202 response can't include the row id because the row doesn't exist yet. If the
 consumer stops, the producer keeps accepting events and the stream grows without a limit.
@@ -79,10 +191,12 @@ consumer stops, the producer keeps accepting events and the stream grows without
 Inspect the stream with:
 
 ```bash
-docker exec redis redis-cli XLEN payload:write-stream
-docker exec redis redis-cli XPENDING payload:write-stream payload-writers
-docker exec redis redis-cli XRANGE payload:write-stream:dlq - +
+docker exec redis-node-1 redis-cli -c XLEN payload:write-stream
+docker exec redis-node-1 redis-cli -c XPENDING payload:write-stream payload-writers
+docker exec redis-node-1 redis-cli -c XRANGE payload:write-stream:dlq - +
 ```
+
+`-c` follows the redirect to whichever primary owns the key.
 
 ## CPU layout
 
@@ -92,8 +206,8 @@ Each container is pinned to its own cores in `docker-compose.yaml`:
 |-------|-------------------------------|
 | 0–3   | Free for the load generator   |
 | 4–6   | App (`load_test_app`)         |
-| 7–8   | PostgreSQL                    |
-| 9     | Redis (single-threaded)       |
+| 7–8   | PostgreSQL primary and replica |
+| 9     | Redis Cluster (all six nodes) |
 
 To see how throughput scales with the app's core count, override `APP_CPUSET` and
 recreate only the app:
@@ -168,7 +282,24 @@ After a stream test, check that `XLEN payload:write-stream` drains to 0 and comp
 number of new rows (`select count(*) from payloads where event_id is not null`) with
 requests sent.
 
-### Results (2026-10-23)
+### Results with Redis Cluster (2026-10-24)
+
+The same suite after moving to the six-node cluster, with all nodes sharing core 9:
+
+| Endpoint                  | Req/s  | p50     | p90     | p99      | p99.9    | Errors |
+|---------------------------|--------|---------|---------|----------|----------|--------|
+| GET `/local/payload`      | 34,214 | 1.27 ms | 1.98 ms | 5.87 ms  | 18.6 ms  | 0      |
+| POST `/local/payload`     | 30,640 | 1.42 ms | 2.25 ms | 7.41 ms  | 39.8 ms  | 0      |
+| GET `/database/payload`   | 29,298 | 1.47 ms | 2.59 ms | 9.93 ms  | 42.7 ms  | 0      |
+| POST `/stream/payload`    | 26,164 | 1.68 ms | 2.61 ms | 6.69 ms  | 18.4 ms  | 0      |
+| POST `/database/payload`  | 12,074 | 3.34 ms | 8.29 ms | 31.6 ms  | 61.3 ms  | 0      |
+
+Cached reads and stream writes are within run-to-run noise of standalone Redis. The sync
+insert path doesn't use Redis, so its lower figure in this run isn't from the cluster.
+This run was taken right after the failover test, so 4 stream entries were left over from
+it; they are covered under Failover above.
+
+### Results with standalone Redis (2026-10-23)
 
 Full suite on Docker Desktop on macOS with the default CPU layout (app 3 cores,
 Postgres 2, Redis 1), `synchronous_commit=off` and virtual threads enabled. Charts of
@@ -223,5 +354,10 @@ variables, as the `app` service in `docker-compose.yaml` does:
 | `SPRING_DATASOURCE_URL`      | `jdbc:postgresql://localhost:5432/users`   |
 | `SPRING_DATASOURCE_USERNAME` | `postgres`                                 |
 | `SPRING_DATASOURCE_PASSWORD` | `postgres`                                 |
+| `APP_DATASOURCE_REPLICA_JDBC_URL` | `jdbc:postgresql://localhost:5433/users?connectTimeout=1&socketTimeout=5` |
 | `SPRING_DATA_REDIS_HOST`     | `localhost`                                |
 | `SPRING_DATA_REDIS_PORT`     | `6379`                                     |
+| `SPRING_DATA_REDIS_CLUSTER_NODES` | unset (standalone); compose sets `redis-node-1:6379,redis-node-2:6379,redis-node-3:6379` |
+
+When `SPRING_DATA_REDIS_CLUSTER_NODES` is set, the app connects to the cluster and ignores
+the host and port.

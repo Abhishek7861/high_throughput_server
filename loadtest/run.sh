@@ -9,7 +9,8 @@ OUT=results/$(date +%Y%m%d-%H%M%S)
 mkdir -p "$OUT"
 
 P() { docker exec fastapi_postgres psql -U postgres -d users -Atc "$1"; }
-R() { docker exec redis redis-cli "$@"; }
+# -c follows cluster redirects to whichever node owns the key
+R() { docker exec redis-node-1 redis-cli -c "$@"; }
 requests() { grep -o '"requests":[0-9]*' "$1" | cut -d: -f2; }
 
 tests=("get_database GET /database/payload"
