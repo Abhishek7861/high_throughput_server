@@ -2,6 +2,9 @@
 
 Spring Boot service for load testing a PostgreSQL read path with a Redis cache in front.
 
+## Architecture
+![img.png](img.png)
+
 ## Running
 
 ### Everything in Docker
