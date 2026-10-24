@@ -1,9 +1,11 @@
 # High Throughput Server
 
-Spring Boot service for load testing a PostgreSQL read path with a Redis cache in front.
+Spring Boot service for load testing a PostgreSQL read path with a Redis cache in front. Spring Boot payload API with Redis caching, Redis Streams write-behind into PostgreSQL, and a wrk load test suite. Reaches ~33k cached reads/s and ~27k async writes/s on 3 cores, with no lost events.
+
+
 
 ## Architecture
-![img.png](img.png)
+![img_1.png](img_1.png)
 
 ## Running
 
